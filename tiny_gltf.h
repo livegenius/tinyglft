@@ -71,6 +71,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include <memory>
 
 //Auto-detect C++14 standard version
 #if !defined(TINYGLTF_USE_CPP14) && defined(__cplusplus) && (__cplusplus >= 201402L)
@@ -268,8 +269,7 @@ static inline int32_t GetNumComponentsInType(uint32_t ty) {
 
 // TODO(syoyo): Move these functions to TinyGLTF class
 bool IsDataURI(const std::string &in);
-bool DecodeDataURI(std::vector<unsigned char> *out, std::string &mime_type,
-                   const std::string &in, size_t reqBytes, bool checkSize);
+
 
 #ifdef __clang__
 #pragma clang diagnostic push
@@ -541,6 +541,19 @@ struct Parameter {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpadded"
 #endif
+
+typedef void (*BufferAllocateFunction)(void **ptr, size_t size, void *user_data);
+typedef void (*BufferDeallocateFunction)(void **ptr, void *user_data);
+
+///
+/// A structure containing Buffer allocation callbacks and a pointer to their user data.
+///
+struct BufferAllocationCallbacks {
+  BufferAllocateFunction allocate;  // Optional encode method
+  BufferDeallocateFunction deallocate;  // Required decode method
+
+  void *user_data;  // An argument that is passed to all callbacks
+};
 
 typedef std::map<std::string, Parameter> ParameterMap;
 typedef std::map<std::string, Value> ExtensionMap;
@@ -1076,7 +1089,8 @@ class Node {
 
 struct Buffer {
   std::string name;
-  std::vector<unsigned char> data;
+  unsigned char *data = nullptr;
+  size_t dataSize = 0;
   std::string
       uri;  // considered as required here but not in the spec (need to clarify)
             // uri is not decoded(e.g. whitespace may be represented as %20)
@@ -1087,8 +1101,32 @@ struct Buffer {
   std::string extras_json_string;
   std::string extensions_json_string;
 
+  BufferAllocationCallbacks *ba_cb;
+
+  void Destroy() {
+    ba_cb->deallocate((void**)&data, ba_cb->user_data);
+    data = nullptr;
+    dataSize = 0;
+  }
   Buffer() = default;
-  DEFAULT_METHODS(Buffer)
+  ~Buffer() {Destroy();}
+  Buffer(const Buffer &) = delete;
+  Buffer(Buffer &&b) TINYGLTF_NOEXCEPT{
+    *this = std::move(b);
+  };
+  Buffer &operator=(const Buffer &) = delete;
+  Buffer &operator=(Buffer &&b) TINYGLTF_NOEXCEPT{
+    name = std::move(b.name);
+    data = b.data; b.data = nullptr;
+    dataSize = b.dataSize; b.dataSize = 0;
+    uri = std::move(b.uri);
+    extras = std::move(b.extras);
+    extensions = std::move(b.extensions);
+    extras_json_string = std::move(b.extras_json_string);
+    extensions_json_string = std::move(b.extensions_json_string);
+    ba_cb = b.ba_cb;
+    return *this;
+  };
   bool operator==(const Buffer &) const;
 };
 
@@ -1243,6 +1281,8 @@ struct URICallbacks {
   void *user_data;  // An argument that is passed to all uri callbacks
 };
 
+
+
 ///
 /// LoadImageDataFunction type. Signature for custom image loading callbacks.
 ///
@@ -1295,6 +1335,14 @@ typedef bool (*ReadWholeFileFunction)(std::vector<unsigned char> *,
                                       void *);
 
 ///
+/// ReadWholeFileFunction2 type. Signature for custom filesystem callbacks.
+/// Writes size bytes to the pointer using the allocation callback. 
+///
+typedef bool (*ReadWholeFileFunction2)(unsigned char *, size_t &,
+                   BufferAllocationCallbacks *, std::string *,
+                   const std::string &, void *);
+
+///
 /// WriteWholeFileFunction type. Signature for custom filesystem callbacks.
 ///
 typedef bool (*WriteWholeFileFunction)(std::string *, const std::string &,
@@ -1309,10 +1357,14 @@ struct FsCallbacks {
   FileExistsFunction FileExists;
   ExpandFilePathFunction ExpandFilePath;
   ReadWholeFileFunction ReadWholeFile;
+  ReadWholeFileFunction2 ReadWholeFile2;
   WriteWholeFileFunction WriteWholeFile;
 
   void *user_data;  // An argument that is passed to all fs callbacks
 };
+
+void DefaultAllocate(void **ptr, size_t size, void *user_data);
+void DefaultDeallocate(void **ptr, void *user_data);
 
 #ifndef TINYGLTF_NO_FS
 // Declaration of default filesystem callbacks
@@ -1329,6 +1381,10 @@ bool FileExists(const std::string &abs_filename, void *);
 std::string ExpandFilePath(const std::string &filepath, void *userdata);
 
 bool ReadWholeFile(std::vector<unsigned char> *out, std::string *err,
+                   const std::string &filepath, void *);
+
+bool ReadWholeFile2(unsigned char *out, size_t &size_,
+                   BufferAllocationCallbacks *ba_cb, std::string *err,
                    const std::string &filepath, void *);
 
 bool WriteWholeFile(std::string *err, const std::string &filepath,
@@ -1437,6 +1493,11 @@ class TinyGLTF {
   void SetFsCallbacks(FsCallbacks callbacks);
 
   ///
+  /// Set callbacks to use for (de)allocation
+  ///
+  void SetBufferAllocationCallbacks(BufferAllocationCallbacks callbacks);
+
+  ///
   /// Set serializing default values(default = false).
   /// When true, default values are force serialized to .glTF.
   /// This may be helpful if you want to serialize a full description of glTF
@@ -1503,7 +1564,8 @@ class TinyGLTF {
   FsCallbacks fs = {
 #ifndef TINYGLTF_NO_FS
       &tinygltf::FileExists, &tinygltf::ExpandFilePath,
-      &tinygltf::ReadWholeFile, &tinygltf::WriteWholeFile,
+      &tinygltf::ReadWholeFile, tinygltf::ReadWholeFile2,
+      &tinygltf::WriteWholeFile,
 
       nullptr  // Fs callback user data
 #else
@@ -1520,7 +1582,16 @@ class TinyGLTF {
       // percent encoded them.
       &tinygltf::URIDecode,
       // URI callback user data
-      nullptr};
+      nullptr
+  };
+
+  BufferAllocationCallbacks ba_cb = {
+      // Just new and delete from C++
+      &tinygltf::DefaultAllocate,
+      &tinygltf::DefaultDeallocate,
+      // callback user data
+      nullptr
+  };
 
   LoadImageDataFunction LoadImageData =
 #ifndef TINYGLTF_NO_STB_IMAGE
@@ -2350,6 +2421,76 @@ bool URIDecode(const std::string &in_uri, std::string *out_uri,
   return true;
 }
 
+static bool LoadExternalFile(Buffer *buffer, std::string *err,
+                             std::string *warn, const std::string &filename,
+                             const std::string &basedir, bool required,
+                             size_t reqBytes, bool checkSize, FsCallbacks *fs) {
+  if (fs == nullptr || fs->FileExists == nullptr ||
+      fs->ExpandFilePath == nullptr || fs->ReadWholeFile == nullptr) {
+    // This is a developer error, assert() ?
+    if (err) {
+      (*err) += "FS callback[s] not set\n";
+    }
+    return false;
+  }
+
+  std::string *failMsgOut = required ? err : warn;
+
+  buffer->Destroy();
+
+  std::vector<std::string> paths;
+  paths.push_back(basedir);
+  paths.push_back(".");
+
+  std::string filepath = FindFile(paths, filename, fs);
+  if (filepath.empty() || filename.empty()) {
+    if (failMsgOut) {
+      (*failMsgOut) += "File not found : " + filename + "\n";
+    }
+    return false;
+  }
+
+
+  size_t sz = 0;
+  std::string fileReadErr;
+  bool fileRead =
+      fs->ReadWholeFile2(buffer->data, sz, buffer->ba_cb,
+         &fileReadErr, filepath, fs->user_data);
+  if (!fileRead) {
+    if (failMsgOut) {
+      (*failMsgOut) +=
+          "File read error : " + filepath + " : " + fileReadErr + "\n";
+    }
+    return false;
+  }
+
+  buffer->dataSize = sz;
+  if (sz == 0) {
+    if (failMsgOut) {
+      (*failMsgOut) += "File is empty : " + filepath + "\n";
+    }
+    return false;
+  }
+
+  if (checkSize) {
+    if (reqBytes == sz) {
+      return true;
+    } else {
+      buffer->Destroy();
+      std::stringstream ss;
+      ss << "File size mismatch : " << filepath << ", requestedBytes "
+         << reqBytes << ", but got " << sz << std::endl;
+      if (failMsgOut) {
+        (*failMsgOut) += ss.str();
+      }
+      return false;
+    }
+  }
+
+  return true;
+}
+
+
 static bool LoadExternalFile(std::vector<unsigned char> *out, std::string *err,
                              std::string *warn, const std::string &filename,
                              const std::string &basedir, bool required,
@@ -2645,6 +2786,9 @@ void TinyGLTF::SetURICallbacks(URICallbacks callbacks) {
 
 void TinyGLTF::SetFsCallbacks(FsCallbacks callbacks) { fs = callbacks; }
 
+void TinyGLTF::SetBufferAllocationCallbacks(BufferAllocationCallbacks callbacks) { ba_cb = callbacks; }
+
+
 #ifdef _WIN32
 static inline std::wstring UTF8ToWchar(const std::string &str) {
   int wstr_size =
@@ -2664,6 +2808,14 @@ static inline std::string WcharToUTF8(const std::wstring &wstr) {
   return str;
 }
 #endif
+
+void DefaultAllocate(void **ptr, size_t size, void *user_data) { 
+  *ptr = new unsigned char[size];
+}
+
+void DefaultDeallocate(void **ptr, void *user_data) {
+  delete[] (unsigned char*)*ptr;
+}
 
 #ifndef TINYGLTF_NO_FS
 // Default implementations of filesystem functions
@@ -2855,6 +3007,90 @@ bool ReadWholeFile(std::vector<unsigned char> *out, std::string *err,
 #endif
 }
 
+bool ReadWholeFile2(unsigned char *out, size_t &size_,
+                   BufferAllocationCallbacks *ba_cb, std::string *err,
+                   const std::string &filepath, void *) {
+#ifdef TINYGLTF_ANDROID_LOAD_FROM_ASSETS
+  if (asset_manager) {
+    AAsset *asset = AAssetManager_open(asset_manager, filepath.c_str(),
+                                       AASSET_MODE_STREAMING);
+    if (!asset) {
+      if (err) {
+        (*err) += "File open error : " + filepath + "\n";
+      }
+      return false;
+    }
+    size_t size = AAsset_getLength(asset);
+    if (size == 0) {
+      if (err) {
+        (*err) += "Invalid file size : " + filepath +
+                  " (does the path point to a directory?)";
+      }
+      return false;
+    }
+
+    ba_cb->allocate((void**)&out, size, ba_cb->user_data);
+    AAsset_read(asset, reinterpret_cast<char *>(out), size);
+    AAsset_close(asset);
+    size_ = size;
+    return true;
+  } else {
+    if (err) {
+      (*err) += "No asset manager specified : " + filepath + "\n";
+    }
+    return false;
+  }
+#else
+#ifdef _WIN32
+#if defined(__GLIBCXX__)  // mingw
+  int file_descriptor =
+      _wopen(UTF8ToWchar(filepath).c_str(), _O_RDONLY | _O_BINARY);
+  __gnu_cxx::stdio_filebuf<char> wfile_buf(file_descriptor, std::ios_base::in);
+  std::istream f(&wfile_buf);
+#elif defined(_MSC_VER) || defined(_LIBCPP_VERSION)
+  // For libcxx, assume _LIBCPP_HAS_OPEN_WITH_WCHAR is defined to accept
+  // `wchar_t *`
+  std::ifstream f(UTF8ToWchar(filepath).c_str(), std::ifstream::binary);
+#else
+  // Unknown compiler/runtime
+  std::ifstream f(filepath.c_str(), std::ifstream::binary);
+#endif
+#else
+  std::ifstream f(filepath.c_str(), std::ifstream::binary);
+#endif
+  if (!f) {
+    if (err) {
+      (*err) += "File open error : " + filepath + "\n";
+    }
+    return false;
+  }
+
+  f.seekg(0, f.end);
+  size_t sz = static_cast<size_t>(f.tellg());
+  f.seekg(0, f.beg);
+
+  if (int64_t(sz) < 0) {
+    if (err) {
+      (*err) += "Invalid file size : " + filepath +
+                " (does the path point to a directory?)";
+    }
+    return false;
+  } else if (sz == 0) {
+    if (err) {
+      (*err) += "File is empty : " + filepath + "\n";
+    }
+    return false;
+  }
+
+  ba_cb->allocate((void**)&out, sz, ba_cb->user_data);
+  f.read(reinterpret_cast<char *>(out),
+         static_cast<std::streamsize>(sz));
+
+  size_ = sz;
+  return true;
+#endif
+}
+
 bool WriteWholeFile(std::string *err, const std::string &filepath,
                     const std::vector<unsigned char> &contents, void *) {
 #ifdef _WIN32
@@ -2994,6 +3230,83 @@ bool IsDataURI(const std::string &in) {
 
   return false;
 }
+
+bool DecodeDataURI(Buffer *buffer, std::string &mime_type,
+                   const std::string &in, size_t reqBytes, bool checkSize) {
+  std::string header = "data:application/octet-stream;base64,";
+  std::string data;
+  if (in.find(header) == 0) {
+    data = base64_decode(in.substr(header.size()));  // cut mime string.
+  }
+
+  if (data.empty()) {
+    header = "data:image/jpeg;base64,";
+    if (in.find(header) == 0) {
+      mime_type = "image/jpeg";
+      data = base64_decode(in.substr(header.size()));  // cut mime string.
+    }
+  }
+
+  if (data.empty()) {
+    header = "data:image/png;base64,";
+    if (in.find(header) == 0) {
+      mime_type = "image/png";
+      data = base64_decode(in.substr(header.size()));  // cut mime string.
+    }
+  }
+
+  if (data.empty()) {
+    header = "data:image/bmp;base64,";
+    if (in.find(header) == 0) {
+      mime_type = "image/bmp";
+      data = base64_decode(in.substr(header.size()));  // cut mime string.
+    }
+  }
+
+  if (data.empty()) {
+    header = "data:image/gif;base64,";
+    if (in.find(header) == 0) {
+      mime_type = "image/gif";
+      data = base64_decode(in.substr(header.size()));  // cut mime string.
+    }
+  }
+
+  if (data.empty()) {
+    header = "data:text/plain;base64,";
+    if (in.find(header) == 0) {
+      mime_type = "text/plain";
+      data = base64_decode(in.substr(header.size()));
+    }
+  }
+
+  if (data.empty()) {
+    header = "data:application/gltf-buffer;base64,";
+    if (in.find(header) == 0) {
+      data = base64_decode(in.substr(header.size()));
+    }
+  }
+
+  // TODO(syoyo): Allow empty buffer? #229
+  if (data.empty()) {
+    return false;
+  }
+
+  if (checkSize) {
+    if (data.size() != reqBytes) {
+      return false;
+    }
+    buffer->dataSize = reqBytes;
+    buffer->ba_cb->allocate((void**)&buffer->data, reqBytes,
+                            buffer->ba_cb->user_data);
+  } else {
+    buffer->dataSize = data.size();
+    buffer->ba_cb->allocate((void**)&buffer->data, data.size(),
+                            buffer->ba_cb->user_data);
+  }
+  memcpy(buffer->data, data.data(), data.size()*sizeof(data[0]));
+  return true;
+}
+
 
 bool DecodeDataURI(std::vector<unsigned char> *out, std::string &mime_type,
                    const std::string &in, size_t reqBytes, bool checkSize) {
@@ -4174,6 +4487,7 @@ static bool ParseOcclusionTextureInfo(
 static bool ParseBuffer(Buffer *buffer, std::string *err, const json &o,
                         bool store_original_json_for_extras_and_extensions,
                         FsCallbacks *fs, const URICallbacks *uri_cb,
+                        BufferAllocationCallbacks *ba_cb,
                         const std::string &basedir, bool is_binary = false,
                         const unsigned char *bin_data = nullptr,
                         size_t bin_size = 0) {
@@ -4194,7 +4508,7 @@ static bool ParseBuffer(Buffer *buffer, std::string *err, const json &o,
     }
   }
 
-  json_const_iterator type;
+/*   json_const_iterator type; //Dead code?
   if (FindMember(o, "type", type)) {
     std::string typeStr;
     if (GetString(GetValue(type), typeStr)) {
@@ -4202,15 +4516,16 @@ static bool ParseBuffer(Buffer *buffer, std::string *err, const json &o,
         // buffer.type = "arraybuffer";
       }
     }
-  }
+  } */
 
+  buffer->ba_cb = ba_cb;
   if (is_binary) {
     // Still binary glTF accepts external dataURI.
     if (!buffer->uri.empty()) {
       // First try embedded data URI.
       if (IsDataURI(buffer->uri)) {
         std::string mime_type;
-        if (!DecodeDataURI(&buffer->data, mime_type, buffer->uri, byteLength,
+        if (!DecodeDataURI(buffer, mime_type, buffer->uri, byteLength,
                            true)) {
           if (err) {
             (*err) +=
@@ -4224,7 +4539,7 @@ static bool ParseBuffer(Buffer *buffer, std::string *err, const json &o,
         if (!uri_cb->decode(buffer->uri, &decoded_uri, uri_cb->user_data)) {
           return false;
         }
-        if (!LoadExternalFile(&buffer->data, err, /* warn */ nullptr,
+        if (!LoadExternalFile(buffer, err, /* warn */ nullptr,
                               decoded_uri, basedir, /* required */ true,
                               byteLength, /* checkSize */ true, fs)) {
           return false;
@@ -4252,14 +4567,16 @@ static bool ParseBuffer(Buffer *buffer, std::string *err, const json &o,
       }
 
       // Read buffer data
-      buffer->data.resize(static_cast<size_t>(byteLength));
-      memcpy(&(buffer->data.at(0)), bin_data, static_cast<size_t>(byteLength));
+      buffer->dataSize = static_cast<size_t>(byteLength);
+      ba_cb->allocate((void**)&buffer->data, buffer->dataSize,
+                      ba_cb->user_data);
+      memcpy(buffer->data, bin_data, buffer->dataSize);
     }
 
   } else {
     if (IsDataURI(buffer->uri)) {
       std::string mime_type;
-      if (!DecodeDataURI(&buffer->data, mime_type, buffer->uri, byteLength,
+      if (!DecodeDataURI(buffer, mime_type, buffer->uri, byteLength,
                          true)) {
         if (err) {
           (*err) += "Failed to decode 'uri' : " + buffer->uri + " in Buffer\n";
@@ -4272,7 +4589,7 @@ static bool ParseBuffer(Buffer *buffer, std::string *err, const json &o,
       if (!uri_cb->decode(buffer->uri, &decoded_uri, uri_cb->user_data)) {
         return false;
       }
-      if (!LoadExternalFile(&buffer->data, err, /* warn */ nullptr, decoded_uri,
+      if (!LoadExternalFile(buffer, err, /* warn */ nullptr, decoded_uri,
                             basedir, /* required */ true, byteLength,
                             /* checkSize */ true, fs)) {
         return false;
@@ -5611,6 +5928,7 @@ bool TinyGLTF::LoadFromString(Model *model, std::string *err, std::string *warn,
                               unsigned int json_str_length,
                               const std::string &base_dir,
                               unsigned int check_sections) {
+
   if (json_str_length < 4) {
     if (err) {
       (*err) = "JSON string too short.\n";
@@ -5809,7 +6127,8 @@ bool TinyGLTF::LoadFromString(Model *model, std::string *err, std::string *warn,
       Buffer buffer;
       if (!ParseBuffer(&buffer, err, o,
                        store_original_json_for_extras_and_extensions_, &fs,
-                       &uri_cb, base_dir, is_binary_, bin_data_, bin_size_)) {
+                       &uri_cb, &ba_cb, base_dir, is_binary_, bin_data_,
+                       bin_size_)) {
         return false;
       }
 
@@ -6764,12 +7083,12 @@ static void SerializeValue(const std::string &key, const Value &value,
   }
 }
 
-static void SerializeGltfBufferData(const std::vector<unsigned char> &data,
+static void SerializeGltfBufferData(const unsigned char *data, size_t size,
                                     json &o) {
   std::string header = "data:application/octet-stream;base64,";
-  if (data.size() > 0) {
+  if (size > 0) {
     std::string encodedData =
-        base64_encode(&data[0], static_cast<unsigned int>(data.size()));
+        base64_encode(data, static_cast<unsigned int>(size));
     SerializeStringProperty("uri", header + encodedData, o);
   } else {
     // Issue #229
@@ -6778,7 +7097,7 @@ static void SerializeGltfBufferData(const std::vector<unsigned char> &data,
   }
 }
 
-static bool SerializeGltfBufferData(const std::vector<unsigned char> &data,
+static bool SerializeGltfBufferData(const unsigned char *data, size_t size,
                                     const std::string &binFilename) {
 #ifdef _WIN32
 #if defined(__GLIBCXX__)  // mingw
@@ -6799,9 +7118,9 @@ static bool SerializeGltfBufferData(const std::vector<unsigned char> &data,
   std::ofstream output(binFilename.c_str(), std::ofstream::binary);
   if (!output.is_open()) return false;
 #endif
-  if (data.size() > 0) {
-    output.write(reinterpret_cast<const char *>(&data[0]),
-                 std::streamsize(data.size()));
+  if (size > 0) {
+    output.write(reinterpret_cast<const char *>(data),
+                 std::streamsize(size));
   } else {
     // Issue #229
     // size 0 will be still valid buffer data.
@@ -7058,8 +7377,9 @@ static void SerializeGltfAsset(const Asset &asset, json &o) {
 
 static void SerializeGltfBufferBin(const Buffer &buffer, json &o,
                                    std::vector<unsigned char> &binBuffer) {
-  SerializeNumberProperty("byteLength", buffer.data.size(), o);
-  binBuffer = buffer.data;
+  SerializeNumberProperty("byteLength", buffer.dataSize, o);
+  binBuffer.resize(buffer.dataSize);
+  memcpy(binBuffer.data(), buffer.data, buffer.dataSize);
 
   if (buffer.name.size()) SerializeStringProperty("name", buffer.name, o);
 
@@ -7069,8 +7389,8 @@ static void SerializeGltfBufferBin(const Buffer &buffer, json &o,
 }
 
 static void SerializeGltfBuffer(const Buffer &buffer, json &o) {
-  SerializeNumberProperty("byteLength", buffer.data.size(), o);
-  SerializeGltfBufferData(buffer.data, o);
+  SerializeNumberProperty("byteLength", buffer.dataSize, o);
+  SerializeGltfBufferData(buffer.data, buffer.dataSize, o);
 
   if (buffer.name.size()) SerializeStringProperty("name", buffer.name, o);
 
@@ -7082,8 +7402,8 @@ static void SerializeGltfBuffer(const Buffer &buffer, json &o) {
 static bool SerializeGltfBuffer(const Buffer &buffer, json &o,
                                 const std::string &binFilename,
                                 const std::string &binUri) {
-  if (!SerializeGltfBufferData(buffer.data, binFilename)) return false;
-  SerializeNumberProperty("byteLength", buffer.data.size(), o);
+  if (!SerializeGltfBufferData(buffer.data, buffer.dataSize, binFilename)) return false;
+  SerializeNumberProperty("byteLength", buffer.dataSize, o);
   SerializeStringProperty("uri", binUri, o);
 
   if (buffer.name.size()) SerializeStringProperty("name", buffer.name, o);
